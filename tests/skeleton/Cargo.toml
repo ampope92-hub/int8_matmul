@@ -1,0 +1,11 @@
+[package]
+name = "int8_kernel"
+version = "0.1.0"
+edition = "2021"
+
+# Intentionally empty. The box is offline and the quantization arithmetic is the
+# exercise, so there is no ndarray, no faer and no BLAS binding to lean on.
+[dependencies]
+
+[profile.release]
+opt-level = 3

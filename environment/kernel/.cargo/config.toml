@@ -1,0 +1,3 @@
+# The sandbox has no network. Fail fast and loudly instead of hanging on a fetch.
+[net]
+offline = true

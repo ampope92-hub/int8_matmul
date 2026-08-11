@@ -1,0 +1,120 @@
+name = "int8-matmul"
+
+# The verifier reads only these paths from the agent's final environment. Must stay
+# top-level: nested under [verifier] the value is silently dropped.
+artifacts = [
+    "/app/kernel/src/",
+    "/app/kernel/Cargo.toml",
+    "/app/kernel/Cargo.lock",
+    "/app/out/",
+    "/app/data/",
+]
+
+[metadata]
+category = "ML"
+subcategory = "Kernels"
+tags = ["rust", "quantization", "int8", "kernels", "numerics"]
+languages = ["rust"]
+difficulty = "advanced"
+expert_time_estimate_hours = 8
+author_name = "anonymous"
+author_email = "anonymous"
+
+difficulty_explanation = """
+The weight columns of this export are not on comparable footing: the loudest column peaks
+near 4.9 and the quietest near 0.055, a spread of about 90x. A single symmetric scale over
+the whole matrix is therefore set by the loudest column, and the quiet columns are left
+with two or three usable levels out of 127 — their share of the product arrives as mostly
+quantization noise. Because the bar is placed on the worst column rather than on an average
+or a norm over the whole output, no global scale can be traded into passing: clipping the
+scale to help the quiet columns destroys the loud ones, and the measured optimum over a
+percentile sweep still lands far below the bar. The work is to notice that the scale has to
+be per output column, which requires reading the export rather than reaching for the
+textbook per-tensor recipe.
+
+Two further things have to be right at the same time, and both fail quietly. Rounding has
+to be round-to-nearest; truncation biases every entry toward zero and costs about 6 dB,
+which is the whole margin. And the accumulator has to be wide enough — 512 products of two
+signed bytes overflow 16 bits, and in release-mode Rust that wraps silently instead of
+panicking, so the output looks structurally perfect and is numerically garbage. The kernel
+also has to be written against the raw little-endian exports with no linear-algebra crate
+available, so the row-major indexing of a 512x192 matrix is the agent's own to get right,
+and an index transposition produces a plausible-looking file that fails on accuracy.
+
+The data is synthetic but generated to mirror a real serving checkpoint: per-column
+magnitude spread of the kind that motivated per-channel weight quantization in production
+inference stacks, and an activation batch whose rows are deliberately close in scale so
+that activation handling is not a second gate. This is the work an inference engineer does
+when moving a layer onto an integer path.
+"""
+
+solution_explanation = """
+The reference (solution/solve.sh) writes src/main.rs and runs the crate. It takes one
+symmetric scale per output column from that column's own peak, one scale per activation row
+from that row's peak, quantizes with round-to-nearest clamped to +/-127, accumulates the
+products in i32, and dequantizes by multiplying the integer accumulator by the row and
+column scales. It scores about 36 dB on the worst column against a bar of 32.
+
+Deliberately not clipping below the column peak: unlike activation outliers, the large
+weight entries carry real signal into the product, so a finer step bought by clipping loses
+more than it gains — the 99.9th percentile drops the worst column to roughly 26 dB.
+"""
+
+verification_explanation = """
+The verifier runs in its own container. It collects the agent's crate sources
+(/app/kernel/src, Cargo.toml, Cargo.lock), the output directory and the shipped export as
+artifacts, drops them onto a prepared skeleton whose toolchain is already warm, and runs
+cargo build/run --release --offline itself. The graded files are therefore always the
+output of a clean build of the agent's own code, and a hand-written output file does not
+survive.
+
+Rebuilding the crate means the verifier executes code the agent wrote, so that step is the
+one thing it does not do as root: test.sh hands the crate to an unprivileged user and runs
+the build under it. The reference product is baked into the verifier image at /opt/golden,
+readable only by root. Harbor owns the /tests and /logs mounts at runtime, so permissions
+cannot be enforced there and this verifier deliberately leaves them alone; the copy of the
+reference that arrives under /tests is closed to the unprivileged user on a best-effort
+basis, and whether that succeeded is logged rather than allowed to fail the run. Root alone
+runs pytest and decides the reward from its exit status.
+
+Six checks run. The shipped export is unaltered (sha256); every declared scale is finite
+and positive; output.bin is finite, non-constant and not mostly zeros; the int8 tensors
+span more than a couple of levels; output.bin agrees to a relative 1e-4 with the integer
+product of the agent's own declared tensors and scales; and the lowest per-column SQNR
+against the reference reaches 32 dB. The consistency check is what makes the accuracy check
+meaningful — the agent has both input tensors, so it could compute the exact fp32 product,
+but such a file is inconsistent with the int8 tensors declared beside it and fails. The
+32 dB bar sits between the strongest wrong approach and the weakest correct one, both
+established by sweeping every route across six generated seeds: per-tensor scaling reaches
+at best 12.3 dB even when granted its best percentile clipping, truncation instead of
+round-to-nearest tops out at 30.5, and the weakest passing per-column route scores 34.1.
+The threshold is frozen against the tightest of those seeds.
+"""
+
+relevant_experience = """
+I authored the fleet predictive-maintenance task accepted into the previous edition of the benchmark
+and the Rust harness it runs on, which is where this task's verifier shape comes from. The
+part I would point at here is the calibration method: grant every wrong approach its best
+adversary before placing a threshold. For this task that meant sweeping percentile clipping
+for the per-tensor route rather than only measuring naive max-abs, which lifted the best
+wrong result from 4 dB to 12.3, and separately confirming that six legitimate per-column
+variants — column max, two scale denominators, a light percentile clip, per-row and
+per-tensor activation scaling, and float accumulation of the integer products — all clear
+the bar, so the task is not a single-path puzzle. I also checked that aggressive clipping
+fails for the right reason rather than by accident, since the agent can compute the
+reference itself and measure its own error before committing.
+"""
+
+[verifier]
+timeout_sec = 1800
+environment_mode = "separate"
+
+[agent]
+timeout_sec = 3600
+
+[environment]
+network_mode = "no-network"
+build_timeout_sec = 900
+cpus = 2
+memory_mb = 6144
+storage_mb = 10240
