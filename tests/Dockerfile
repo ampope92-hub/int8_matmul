@@ -37,8 +37,17 @@ RUN useradd --create-home --uid 10001 --shell /bin/bash runner
 # arrive later as artifacts and overwrite these. Keep this in sync with
 # environment/kernel/Cargo.{toml,lock}.
 COPY skeleton /app/kernel
+# The prebuilt skeleton binary must NOT survive into the image. `rm -rf src` alone leaves
+# target/release/{pkg} and its fingerprint behind, and cargo decides freshness by mtime:
+# when Harbor uploads the agent's sources with an mtime older than this layer, cargo skips
+# the rebuild ("Finished" with no "Compiling"), runs the stale `fn main() {}` binary, and
+# nothing is written — the graded output stops coming from the agent's code at all. That is
+# a silent failure: it looks like the agent produced nothing. `cargo clean -p` drops just
+# this crate's artifacts and keeps the compiled dependency tree, which is the whole point
+# of the skeleton.
 RUN cd /app/kernel \
     && cargo build --release --offline \
+    && cargo clean --release -p int8_kernel \
     && rm -rf /app/kernel/src
 
 # Artifact landing directories must exist before Harbor uploads the declared artifacts.

@@ -36,6 +36,11 @@ else
 fi
 
 rm -f /app/out/*.bin
+# Harbor uploads the agent's sources with whatever mtime they carried in its container,
+# which can predate this image's own layers. Cargo decides freshness by mtime, so an older
+# source silently counts as "already built" — stamp the collected sources to now so the
+# rebuild below is unconditional. Belt and braces with the `cargo clean -p` in tests/Dockerfile.
+find /app/kernel/src -type f -exec touch {} +
 runuser -u runner -- bash -c 'cd /app/kernel && cargo run --release --offline'
 echo "kernel exit status: $?"
 
