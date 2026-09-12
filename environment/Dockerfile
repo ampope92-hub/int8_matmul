@@ -35,4 +35,8 @@ RUN cd /app/kernel \
     && cargo build --release --offline \
     && rm -rf /app/kernel/target/release/int8_kernel /app/out
 
+# Where a serving run finds the parameters the calibration run committed. Empty here: the
+# grader puts the file there. It exists so the two steps can be rehearsed on this box.
+RUN mkdir -p /app/scheme
+
 WORKDIR /app

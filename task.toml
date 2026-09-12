@@ -6,6 +6,8 @@ artifacts = [
     "/app/kernel/src/",
     "/app/kernel/Cargo.toml",
     "/app/kernel/Cargo.lock",
+    # Collected for completeness only. The verifier empties it and rebuilds the crate, so
+    # nothing the agent left here is ever graded.
     "/app/out/",
     "/app/data/",
 ]
@@ -16,104 +18,77 @@ subcategory = "Kernels"
 tags = ["rust", "quantization", "int8", "kernels", "numerics"]
 languages = ["rust"]
 difficulty = "advanced"
-expert_time_estimate_hours = 8
+expert_time_estimate_hours = 5
 author_name = "anonymous"
 author_email = "anonymous"
 
 difficulty_explanation = """
-The weight columns of this export are not on comparable footing: the loudest column peaks
-near 4.9 and the quietest near 0.055, a spread of about 90x. A single symmetric scale over
-the whole matrix is therefore set by the loudest column, and the quiet columns are left
-with two or three usable levels out of 127 — their share of the product arrives as mostly
-quantization noise. Because the bar is placed on the worst column rather than on an average
-or a norm over the whole output, no global scale can be traded into passing: clipping the
-scale to help the quiet columns destroys the loud ones, and the measured optimum over a
-percentile sweep still lands far below the bar. The work is to notice that the scale has to
-be per output column, which requires reading the export rather than reaching for the
-textbook per-tensor recipe.
+The kernel is a hand-written int8 dense matmul in Rust with no BLAS. Writing one is ordinary work. What decides the outcome is a scheme decision, and the task is built so that the decision has to be made before the numbers it will be judged on exist.
 
-Two further things have to be right at the same time, and both fail quietly. Rounding has
-to be round-to-nearest; truncation biases every entry toward zero and costs about 6 dB,
-which is the whole margin. And the accumulator has to be wide enough — 512 products of two
-signed bytes overflow 16 bits, and in release-mode Rust that wraps silently instead of
-panicking, so the output looks structurally perfect and is numerically garbage. The kernel
-also has to be written against the raw little-endian exports with no linear-algebra crate
-available, so the row-major indexing of a 512x192 matrix is the agent's own to get right,
-and an index transposition produces a plausible-looking file that fails on accuracy.
+The layer is quantized the way a serving path really does it. One offline calibration step gets the weight matrix and one capture of activations, and commits a quantized weight matrix, its column scales and at most 512 f32 of anything else it wants to carry forward. Then the serving step runs on captures the calibration step never saw, with no weights on the box in either form, and all it can do is turn each capture into int8 codes and a per-row scale. The score is formed from the committed weight side and the serving run's codes together, so the work that decides it is finished before the graded capture is drawn.
 
-The data is synthetic but generated to mirror a real serving checkpoint: per-column
-magnitude spread of the kind that motivated per-channel weight quantization in production
-inference stacks, and an activation batch whose rows are deliberately close in scale so
-that activation handling is not a second gate. This is the work an inference engineer does
-when moving a layer onto an integer path.
+The weights are the easy half and are left easy: the contract names the granularity, one scale per output column and one per activation row. Column peaks span about 90x, so a single tensor-wide weight scale scores under 3 dB and is ruled out in a minute.
+
+The activations are the half that decides it. Twelve of the 512 input channels carry values about 45x the rest, and they are the same twelve in every row of every capture, which is the ordinary shape of a real activation trace rather than anything unusual. A per-row scale is set by whichever channel is hottest in that row, and that is always an outlier channel, so every ordinary channel in the row is quantized with a step sized for a value it has nothing to do with. No choice of per-row scale escapes it, because the problem is a property of the column and the row scale is the only freedom the serving step has. Quantizing each capture as it arrives reaches 23.4 to 23.8 dB on the shipped export and 24.6 to 25.0 dB on the second one, against bars of 29 and 28.
+
+The way out is that the magnitude does not have to be lived with, it can be moved. Dividing input channel k of the activations by s_k and multiplying row k of the weights by the same s_k leaves the product algebraically unchanged, so the reference the score is measured against does not move either. Two things make that hard to arrive at by accident. The first is that it has to happen at calibration, because s needs the activation peaks and the weight peaks together and only that step is handed both, and it has to be recognised as the thing worth spending params.bin on. The second is the balance. Moving all of the magnitude, which is the obvious move once the idea occurs, reaches 25.1 to 25.7 dB on the shipped export and 23.6 to 25.0 on the second, because a weight column's scale then has to cover its own hot rows and the error comes back on the other side. Driving s off the weight peaks alone, with no activation term, reaches 23.0 to 23.6 dB. Every balanced split, alpha 0.3 through 0.7 in s_k = a_peak^alpha / w_peak^(1-alpha), reaches at least 33.4 dB on the shipped export and 32.5 on the second. The bars sit about 3 dB above the best route that fails and 4 dB below the worst route that works.
+
+What the split also does is close the route that a bar on a locally computable quantity always leaves open. When a kernel holds both tensors and knows the scoring formula it can skip the scheme entirely and optimise the integer codes against the product it can work out for itself: error-feedback rounding of the weight codes against the capture reaches well past any bar that the honest route clears. Here that route earns nothing, because the error it minimises is the one belonging to the capture it was given and the capture it is graded on is a different draw. Measured with the weight side committed and the serving captures fresh, error-feedback rounding lands at 23.2 to 23.9 dB on the shipped export and 24.4 to 24.8 on the second, on top of the reflex rather than above it, because the error that survives a change of batch is the activation step size and no amount of weight-side adjustment reaches it.
+
+That argument covers the weight side, where the refinement has to be committed before the graded capture is drawn. The mirror of it runs on the activation side at serving time, and a change of batch does not touch it, because the refinement would happen after the capture arrives. A serving run holding the committed weight codes could form the graded product for itself, then walk its own activation codes down against it until the worst column came in under the bar, one capture at a time, with params.bin left empty and no migration anywhere. That route is closed by construction rather than by numbers. The serving step is not handed the weight side at all, in float or in int8; it gets params.bin and the capture, and the server forms the product from the codes it writes back. With no weights on the box there is nothing to measure an output error against, so the only thing that can protect the peaky channels is the factor calibration already committed.
+
+The problem is fully diagnosable from what the agent has. Running its own scheme back over its own calibration capture shows the reflex at 24.4 dB and the balanced split at 36.6 dB, so the failure is visible before anything is handed in. It is the fix that has to be found, not the symptom.
+
+The score is the worst of the 192 columns, not an average, so a column cannot be traded away to buy another. The same kernel goes through both steps again on a second export, a different draw of both tensors whose twelve hot channels are a different twelve, so nothing located once can be written into the source.
+
+The data dictionary the agent reads describes the export as a capture from a production trace. That framing is deliberate and is not an authoring error: it keeps the agent measuring the tensors in front of it rather than assuming a seeded distribution and reverse-engineering the generator. Both exports are in fact synthetic, generated by solution/generate_export.py, which documents the process and reproduces either one, its serving captures and their reference products from a seed. The real-world job is the ordinary one of moving a layer onto an int8 serving path, where per-channel activation outliers are a well-known obstacle and the reason production quantization pipelines do this migration at all.
 """
 
 solution_explanation = """
-The reference (solution/solve.sh) writes src/main.rs and runs the crate. It takes one
-symmetric scale per output column from that column's own peak, one scale per activation row
-from that row's peak, quantizes with round-to-nearest clamped to +/-127, accumulates the
-products in i32, and dequantizes by multiplying the integer accumulator by the row and
-column scales. It scores about 36 dB on the worst column against a bar of 32.
+The calibration step reads both tensors. Before quantizing anything, for each of the 512 input channels it takes the peak absolute activation across the capture and the peak absolute weight across the output columns and forms s_k = a_peak_k^0.5 / w_peak_k^0.5. It divides activation channel k by s_k and multiplies weight row k by s_k, which leaves the product algebraically unchanged but moves the outlier magnitude off the activations, which have only a per-row scale to defend themselves with, and onto the weights, which have a per-column scale. Then the standard path: one scale per output column from that column's peak, one scale per activation row from that row's peak, round to nearest with clamping to [-127, 127], accumulate in i32, dequantize as a_scales[m] * w_scales[n] * acc. It writes the quantized weights, the column scales, the 512 factors as params.bin, and the quantized capture with its product.
 
-Deliberately not clipping below the column peak: unlike activation outliers, the large
-weight entries carry real signal into the product, so a finer step bought by clipping loses
-more than it gains — the 99.9th percentile drops the worst column to roughly 26 dB.
+The serving step reads the capture it was handed and params.bin, divides each channel by its factor, takes a per-row scale and rounds to nearest, and writes the codes and the scales. It has nothing else to work with, which is the point: the weights are not on the box.
+
+The insight is that the migration exists, that it belongs to the calibration step because only that step can compute it, and that it has to be balanced. solution/main.rs is the reference; SMOOTH_ALPHA at the top is the exponent, and setting it to 0.0 gives the reflex and 1.0 the over-corrected route, both of which fail. It scores about 36.9 dB on the shipped export's serving runs and about 36.5 on the second export's, against bars of 29 and 28.
 """
 
 verification_explanation = """
-The verifier runs in its own container. It collects the agent's crate sources
-(/app/kernel/src, Cargo.toml, Cargo.lock), the output directory and the shipped export as
-artifacts, drops them onto a prepared skeleton whose toolchain is already warm, and runs
-cargo build/run --release --offline itself. The graded files are therefore always the
-output of a clean build of the agent's own code, and a hand-written output file does not
-survive.
+The verifier runs in its own container. It collects the agent's crate sources (/app/kernel/src, Cargo.toml, Cargo.lock), the output directory and the shipped export as artifacts, drops them onto a prepared skeleton whose toolchain is already warm, and builds and runs the crate itself with cargo --release --offline. The graded files are therefore always the output of a clean build of the agent's own code, and a hand-written output file does not survive.
 
-Rebuilding the crate means the verifier executes code the agent wrote, so that step is the
-one thing it does not do as root: test.sh hands the crate to an unprivileged user and runs
-the build under it. The reference product is baked into the verifier image at /opt/golden,
-readable only by root. Harbor owns the /tests and /logs mounts at runtime, so permissions
-cannot be enforced there and this verifier deliberately leaves them alone; the copy of the
-reference that arrives under /tests is closed to the unprivileged user on a best-effort
-basis, and whether that succeeded is logged rather than allowed to fail the run. Root alone
-runs pytest and decides the reward from its exit status.
+Each export gets one calibration run and then two serving runs. The calibration run is handed both tensors; its weights_q.bin, w_scales.bin and params.bin are copied to a root-only path, params.bin is handed back at /app/scheme read-only, and weights.bin is removed from /app/data. Each serving run then gets one of two captures baked into the verifier image, drawn from the same trace as the calibration capture and never present in any container the agent can reach. The accuracy score is formed here rather than read from the kernel: the frozen weights_q and w_scales from the calibration run are put beside the acts_q and a_scales from the serving run, and the worst per-column SQNR of that product is scored against the double-precision product of the unquantized capture and the unquantized weights.
 
-Six checks run. The shipped export is unaltered (sha256); every declared scale is finite
-and positive; output.bin is finite, non-constant and not mostly zeros; the int8 tensors
-span more than a couple of levels; output.bin agrees to a relative 1e-4 with the integer
-product of the agent's own declared tensors and scales; and the lowest per-column SQNR
-against the reference reaches 32 dB. The consistency check is what makes the accuracy check
-meaningful — the agent has both input tensors, so it could compute the exact fp32 product,
-but such a file is inconsistent with the int8 tensors declared beside it and fails. The
-32 dB bar sits between the strongest wrong approach and the weakest correct one, both
-established by sweeping every route across six generated seeds: per-tensor scaling reaches
-at best 12.3 dB even when granted its best percentile clipping, truncation instead of
-round-to-nearest tops out at 30.5, and the weakest passing per-column route scores 34.1.
-The threshold is frozen against the tightest of those seeds.
+Between every run the crate tree is restored from a pristine copy taken before the first one, /app/out is emptied, everything the build user owns anywhere on the box is removed, on every mount rather than the root one alone, along with the contents of /tmp, /var/tmp, /dev/shm and the lock directories, and /app itself is root-owned with only the crate tree and /app/out writable, so the instruction's "each of those runs is a fresh box" is enforced rather than promised: a calibration run that writes the weight matrix somewhere for a serving run to pick up finds nothing there. Cargo's home stays root-owned and is never handed to the build user, for the same reason, and the pristine copy is root-owned with no write bit for anyone else whatever modes the sources arrived with, so a run cannot edit the tree the next run is rebuilt from. params.bin is capped at 512 f32, which is what makes it a decision rather than a smuggling channel, since 512 floats cannot carry a 512x192 matrix.
+
+Rebuilding the crate means the verifier executes code the agent wrote, so that step is the one thing it does not do as root. test.sh hands the crate and the output directory to an unprivileged build user and runs it through setpriv with supplementary groups cleared and no-new-privileges set, so neither an inherited group nor a setuid binary can widen what that code reaches. The built binary is started from /app/kernel, the directory the instruction's cargo run command is given, so a kernel that resolves its files relative to that directory behaves as it does under that command; oracle_cwd_kernel, the reference with every path relative to it, scores 1. The withheld captures and their reference products are baked into the image under /opt, readable only by root, and those are the copies the tests read. The whole /tests mount is closed to the build user before anything untrusted starts, and if it is still reachable the run is abandoned with reward 0 rather than graded. Each run happens in its own session, its entire process group is torn down and every process the build user still owns is swept before the next one starts and before pytest runs, so no double-forked child can write into a later run's output or rewrite the reward after it is computed. Only regular files are staged out of /app/out, so a symlink dropped at params.bin cannot ride through the copy into /app/scheme carrying the weight matrix behind it, and one dropped at an output path cannot hand the verifier its own reference back. pytest runs with the working directory off the import path, so agent code that writes into /app cannot shadow the pytest module and no-op the suite. /logs/verifier is closed to the build user before anything untrusted runs, and the reward is written there last, once nothing hostile is running, by root alone, from pytest's exit status.
+
+Twelve checks run, each one a requirement instruction.md states. The first is that the crate is what the instruction says it has to be: no build script in the manifest, every dependency table of every kind empty, the target-specific and dev and build forms included, and only .rs files under src, each of them UTF-8 text rather than a binary carrying that name. Nothing reads the source text, since a name in a comment is not a use of it; instead test.sh builds the crate with the toolchain open to the build user and then starts the built binary directly, not through a shell, with every compiler, interpreter and shell on the box, gcc, python, perl, bash, sh and the Rust toolchain among them, closed to that user by mode for the seconds it runs and reopened straight after, with a trap that reopens them if the script dies, so a kernel that hands work to another program or to a script it carries fails at run time. The instruction states this. The consistency identity the instruction gives is enforced on both steps rather than only on the calibration run. Accuracy is scored from the serving run's codes put beside the frozen weight side rather than from its output.bin, so without that second consistency check a serving step could omit output.bin altogether, or write something unrelated to the integer product it is supposed to be, and still pass everything the instruction asks of it. The shipped export comes back byte for byte as issued, compared against a root-only copy baked into the verifier image rather than against a digest constant, and the runs are fed from that copy. For each export, the calibration run writes a weight side of the declared shapes and a params.bin that is a whole number of f32 within the cap, and its output.bin agrees to a relative 1e-4 with the integer product of its own declared tensors and scales, which is what stops an exact fp32 product being written there instead of the int8 path. That identity on its own is satisfied by zeros, so output.bin is also held against the exact product of the capture and the weights and its worst column has to come within 20 dB, a floor every real quantization clears easily and an all-zero set of codes cannot. For each of the four serving runs, the worst-column SQNR reaches the bar. The stored-constants route is closed by the second export's bar alone: its captures and weights never reach the agent, so numbers written into the source score what a batch-independent guess is worth there. There is no separate rule about outputs differing between exports, since a fixed scale vector is a legitimate scheme if it clears the bars.
+
+The bars sit between measured routes rather than being chosen by taste, and every route below was measured with the weight side committed and graded on the two serving captures that ship. Quantizing each capture as it arrives reaches 23.82 and 23.40 dB on the shipped export and 24.56 and 24.96 on the second. Error-feedback rounding of the weight codes against the calibration capture reaches 23.93 and 23.16, and 24.42 and 24.76. Moving the whole channel magnitude into the weights reaches 25.72 and 25.14, and 24.95 and 23.57. Driving the factors off the weight peaks alone reaches 23.04 and 23.60. A single tensor-wide weight scale scores under 3 dB. Every balanced split, alpha 0.3 through 0.7, reaches at least 33.37 dB on the shipped export and 32.52 on the second. So the 29 dB bar sits 3.3 dB above the best route that fails and 3.9 below the worst that works, and the 28 dB bar 3.0 above and 4.5 below. The second export's bar is the slacker of the two because it was not the export the routes were swept on. Six further independent draws of the export process put the same three routes at 22.1 to 24.3 dB for the reflex, 22.2 to 24.3 for error feedback and 36.4 to 37.4 for the balanced split, so the ordering is a property of the construction rather than of these two seeds.
+
+Both exports come out of one script: solution/generate_export.py shipped and solution/generate_export.py holdout write the tensor pairs, the serving captures and their reference products from their seeds, 5 and 23, through the same code path, so the second export's twelve hot channels are the same construction as the first's rather than a claim about it. The calibration is re-runnable rather than asserted: draw further exports with other seeds and rebuild solution/main.rs with SMOOTH_ALPHA set to 0.0 and 1.0 for the failing ends and across 0.3 to 0.7 for the balanced ones.
 """
 
 relevant_experience = """
-I authored the fleet predictive-maintenance task accepted into the previous edition of the benchmark
-and the Rust harness it runs on, which is where this task's verifier shape comes from. The
-part I would point at here is the calibration method: grant every wrong approach its best
-adversary before placing a threshold. For this task that meant sweeping percentile clipping
-for the per-tensor route rather than only measuring naive max-abs, which lifted the best
-wrong result from 4 dB to 12.3, and separately confirming that six legitimate per-column
-variants — column max, two scale denominators, a light percentile clip, per-row and
-per-tensor activation scaling, and float accumulation of the integer products — all clear
-the bar, so the task is not a single-path puzzle. I also checked that aggressive clipping
-fails for the right reason rather than by accident, since the agent can compute the
-reference itself and measure its own error before committing.
+I authored the fleet predictive-maintenance task accepted into the previous edition of the benchmark and the Rust harness it runs on, which is where this task's verifier shape comes from. The part I would point at here is a structural one rather than a numerical one: a threshold cannot carry a task whose graded quantity the solver can compute for itself, because anything that can be measured in the box can be optimised in the box, whatever the intended insight was. So this one is built the way the real pipeline is, with the decision committed while the data it will be judged on does not yet exist. The calibration habit behind the bars is the other half: grant every wrong approach its best adversary and measure it, rather than measuring a naive version of it and asserting a gap.
 """
-
 [verifier]
-timeout_sec = 1800
+# Six runs of the agent's kernel happen here: a calibration run and two serving runs for each
+# of the two exports. Each one starts from a pristine copy of the crate, so each one compiles.
+# The crate has no dependencies and builds in seconds, but 1800 leaves no headroom for six.
+timeout_sec = 3600
 environment_mode = "separate"
+network_mode = "no-network"
 
 [agent]
-timeout_sec = 3600
-
-[environment]
+timeout_sec = 5400
 network_mode = "no-network"
+
+# Must be "public" on every task: the environment phase is where the image is built and the
+# solve harness installs its own toolchain, and an offline baseline kills every attempt
+# before the agent starts. The task itself stays air-gapped — the agent and verifier phases
+# above are both "no-network", and every crate is vendored into the image at build time.
+[environment]
+network_mode = "public"
 build_timeout_sec = 900
 cpus = 2
 memory_mb = 6144

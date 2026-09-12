@@ -1,5 +1,13 @@
 .git
 .gitignore
+solution/
+tests/
+.env
+.env.*
+.venv/
+venv/
+env/
+ENV/
 __pycache__/
 *.pyc
 .DS_Store

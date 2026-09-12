@@ -23,9 +23,12 @@ RUN apt-get update \
 COPY --from=rust /usr/local/cargo /usr/local/cargo
 COPY --from=rust /usr/local/rustup /usr/local/rustup
 
-# Verifier tooling, pinned. Nothing is installed at trial time. numpy lives here and only
-# here — the agent image has no Python numerics stack, which is the point of the task.
-RUN pip install --no-cache-dir pytest==8.4.1 pytest-json-ctrf==0.3.5 numpy==2.3.2
+# Verifier tooling, installed from a hash-pinned lockfile so the image cannot pick up a
+# different build of any package, transitive ones included. Nothing is installed at trial
+# time. numpy lives here and only here — the agent image has no Python numerics stack,
+# which is the point of the task.
+COPY requirements.txt /tmp/requirements.txt
+RUN pip install --no-cache-dir --require-hashes --no-deps -r /tmp/requirements.txt && rm -f /tmp/requirements.txt
 
 # test.sh rebuilds and runs the agent's crate, so agent-authored code executes in this
 # image — and this image holds the answer key. That code runs as `runner`, never root:
@@ -53,17 +56,42 @@ RUN cd /app/kernel \
 # Artifact landing directories must exist before Harbor uploads the declared artifacts.
 RUN mkdir -p /app/kernel/src /app/data /app/out
 
-# Building as `runner` means cargo writes target/ and the CARGO_HOME package-cache lock;
-# neither holds anything secret. /app is runner-owned so the crate can create its output,
-# but sticky so runner cannot rename or delete the root-owned export it sits beside.
-RUN chown -R runner:runner /app /usr/local/cargo \
-    && chmod 1755 /app
+# The crate tree and the output directory are runner's; /app itself stays root's, so the build
+# user has nowhere directly under it to leave a file for a later run to find. CARGO_HOME stays
+# root-owned and is never handed over, so a run cannot write into it at all; the crate tree
+# itself is restored from a root-only pristine copy before each of the six runs, which is what
+# stops one run leaving state in target/ for a later one to read back.
+RUN chown -R runner:runner /app/kernel /app/out \
+    && chown root:root /app \
+    && chmod 755 /app
 
-# The graded answer key, at a path Harbor does not reserve, readable only by root. /tests is
-# a runtime mount — permissions set on it here are both ineffective and a documented cause of
-# verifier failure — so the labels cannot be protected there. test_outputs.py reads this copy.
-COPY golden /opt/golden
-RUN chmod 700 /opt/golden && chmod 600 /opt/golden/*
+# Where the frozen calibration parameters are handed back for a serving run. Root owns it and
+# the file inside it is 0444: the serving run reads what calibration committed and cannot
+# rewrite it.
+RUN mkdir -p /app/scheme && chmod 555 /app/scheme
+
+# The second export of the layer, weights and calibration capture. test.sh swaps this in for
+# /app/data and puts the agent's kernel through the same two steps, which is what proves the
+# scheme is worked out at run time rather than pasted into the source. /tests is a runtime
+# mount — permissions set on it here are both ineffective and a documented cause of verifier
+# failure — so nothing withheld can be protected there; these root-only copies are what the
+# verifier actually reads.
+COPY holdout /opt/holdout
+RUN chmod 700 /opt/holdout && chmod 600 /opt/holdout/*
+
+# The serving captures and their double-precision reference products, for both exports. These
+# never reach any container the agent can see, and they do not exist as far as the calibration
+# step is concerned: the weight side is committed first and only then is the kernel handed one
+# of these. That is what stops the graded quantity from being computable while the decisions
+# that drive it are still open.
+COPY apply /opt/apply
+RUN chmod 700 /opt/apply && chmod -R go-rwx /opt/apply
+
+# The shipped export as issued. test_shipped_export_unmodified compares the copy that comes back
+# from the agent against these bytes and the shipped calibration run is fed from here, so no
+# digest constant exists to fall out of step with the file the agent is given.
+COPY shipped /opt/shipped
+RUN chmod 700 /opt/shipped && chmod 600 /opt/shipped/*
 
 COPY . /tests/
 
